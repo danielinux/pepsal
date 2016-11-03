@@ -3,6 +3,7 @@
  *
  * Copyleft Daniele Lacamera 2005
  * Copyleft Dan Kruchining <dkruchinin@acm.com> 2010
+ * Copyleft Joaquin Muguerza <jmuguerza@toulouse.viveris.fr> 2016
  * See AUTHORS and COPYING before using this software.
  *
  *
@@ -13,7 +14,6 @@
 #include "pepsal.h"
 #include "pepqueue.h"
 #include "syntab.h"
-#define IPQUEUE_OLD 0
 
 #include <unistd.h>
 #include <assert.h>
@@ -39,39 +39,33 @@
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
-
+#include <net/if.h>
 
 #include <sys/poll.h>
 #include <string.h>
 #include <time.h>
 #include <signal.h>
+#include <syslog.h>
 
 #include <sys/time.h>
-
-
-#if (IPQUEUE_OLD)
-#include <libipq/libipq.h>
-#else
-#include <libnetfilter_queue/libnetfilter_queue.h>
-#endif
 
 /*
  * Data structure to fill with packet headers when we
  * get a new syn:
  *
  * struct ipv4_packet
- *		iph : ip header for the packet
- *		tcph: tcp header for the segment
+ *      iph : ip header for the packet
+ *      tcph: tcp header for the segment
  *
  */
 struct ipv4_packet{
-	struct iphdr iph;
-	struct tcphdr tcph;
+    struct iphdr iph;
+    struct tcphdr tcph;
 };
 
 static int DEBUG = 0;
 static int background = 0;
-static int queuenum = 0;
+static int fastopen = 0;
 static int gcc_interval = PEP_GCC_INTERVAL;
 static int pending_conn_lifetime = PEP_PENDING_CONN_LIFETIME;
 static int portnum = PEP_DEFAULT_PORT;
@@ -118,22 +112,27 @@ struct pep_logger {
 static struct pep_queue active_queue, ready_queue;
 static struct pep_logger logger;
 
-static pthread_t queuer;
 static pthread_t listener;
 static pthread_t poller;
 static pthread_t timer_sch;
 static pthread_t *workers = NULL;
 
-#define pep_error(fmt, args...)                     \
-    __pep_error(__FUNCTION__, __LINE__, fmt, ##args)
+#define pep_error(fmt, args...)                       \
+    syslog(LOG_ERR, "%s():%d: " fmt " (errno %d)",    \
+           __FUNCTION__, __LINE__, ##args, errno);    \
+    __pep_error(__FUNCTION__, __LINE__, fmt, ##args)  
 
-#define pep_warning(fmt, args...)                   \
+#define pep_warning(fmt, args...)                     \
+    syslog(LOG_WARNING, "%s():%d: " fmt,              \
+           __FUNCTION__, __LINE__, ##args);           \
     __pep_warning(__FUNCTION__, __LINE__, fmt, ##args)
 
-#define PEP_DEBUG(fmt, args...)                     \
-    if (DEBUG) {                                    \
-        fprintf(stderr, "[DEBUG] %s(): " fmt "\n",  \
-                __FUNCTION__, ##args);              \
+#define PEP_DEBUG(fmt, args...)                       \
+    if (DEBUG) {                                      \
+        fprintf(stderr, "[DEBUG] %s(): " fmt "\n",    \
+                __FUNCTION__, ##args);                \
+        syslog(LOG_DEBUG, "%s(): " fmt, __FUNCTION__, \
+              ##args);                                \
     }
 
 #define PEP_DEBUG_DP(proxy, fmt, args...)                           \
@@ -142,6 +141,8 @@ static pthread_t *workers = NULL;
         toip(__buf, (proxy)->src.addr);                             \
         fprintf(stderr, "[DEBUG] %s(): {%s:%d} " fmt "\n",          \
                 __FUNCTION__, __buf, (proxy)->src.port, ##args);    \
+        syslog(LOG_DEBUG, "%s(): {%s:%d} " fmt, __FUNCTION__,       \
+               __buf, (proxy)->src.port, ##args);                   \
     }
 
 static void __pep_error(const char *function, int line, const char *fmt, ...)
@@ -162,6 +163,7 @@ static void __pep_error(const char *function, int line, const char *fmt, ...)
 
     fprintf(stderr, "%s\n         AT: %s:%d\n", buf, function, line);
     va_end(ap);
+    closelog();
     exit(EXIT_FAILURE);
 }
 
@@ -183,11 +185,11 @@ static void __pep_warning(const char *function, int line, const char *fmt, ...)
 
 static void usage(char *name)
 {
-	fprintf(stderr,"Usage: %s [-V] [-h] [-v] [-d] [-q QUEUENUM]"
+    fprintf(stderr,"Usage: %s [-V] [-h] [-v] [-d] [-f]"
             " [-a address] [-p port]"
-	    " [-c max_conn] [-l logfile] [-t proxy_lifetime]"
-	    " [-g garbage collector interval]\n", name);
-	exit(EXIT_SUCCESS);
+            " [-c max_conn] [-l logfile] [-t proxy_lifetime]"
+            " [-g garbage collector interval]\n", name);
+    exit(EXIT_SUCCESS);
 }
 
 /*
@@ -218,14 +220,14 @@ static int nonblocking_err_p(int err)
  */
 static void toip(char *ret, int address)
 {
-	int a,b,c,d;
+    int a,b,c,d;
 
-	a = (0xFF000000 & address) >> 24;
-	b = (0x00FF0000 & address) >> 16;
-	c = (0x0000FF00 & address) >> 8;
-	d = 0x000000FF & address;
+    a = (0xFF000000 & address) >> 24;
+    b = (0x00FF0000 & address) >> 16;
+    c = (0x0000FF00 & address) >> 8;
+    d = 0x000000FF & address;
 
-	snprintf(ret,16,"%d.%d.%d.%d",a,b,c,d);
+    snprintf(ret,16,"%d.%d.%d.%d",a,b,c,d);
 }
 
 static char *conn_stat[] = {
@@ -273,13 +275,13 @@ static void logger_fn(void)
 
 static void setup_socket(int fd)
 {
-	struct timeval t= { 0, 10000 };
+    struct timeval t= { 0, 10000 };
     int flags;
 
     flags = fcntl(fd, F_GETFL, 0);
-	fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &t, sizeof(struct timeval));
-	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &t, sizeof(struct timeval));
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &t, sizeof(struct timeval));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &t, sizeof(struct timeval));
     PEP_DEBUG("Socket %d: Setting up timeouts and syncronous mode.", fd);
 }
 
@@ -493,28 +495,19 @@ static void pep_proxy_data(struct pep_endpoint *from, struct pep_endpoint *to)
     }
 }
 
-/* NFQUEUE callback function for incoming TCP syn */
-static int nfqueue_get_syn(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
-                           struct nfq_data *nfa, void *data)
+static int save_proxy_from_socket(int sockfd, struct sockaddr_in cliaddr)
 {
-	unsigned char *buffer;
-	struct ipv4_packet *ip4;
-	struct pep_proxy *proxy, *dup;
-	int id = 0, ret, added = 0;
-	struct nfqnl_msg_packet_hdr *ph;
+    char *buffer;
+    struct ipv4_packet *ip4;
+    struct pep_proxy *proxy, *dup;
+    struct syntab_key key;
+    int id = 0, ret, added = 0;
+    struct sockaddr_in orig_dst;
+    int addrlen = sizeof(orig_dst);
 
-    PEP_DEBUG("Eneter callback...");
+    PEP_DEBUG("Saving new SYN...");
 
     proxy = NULL;
-	ph = nfq_get_msg_packet_hdr(nfa);
-	if(!ph){
-        pep_error("Unable to get packet header!");
-	}
-
-	id = ntohl(ph->packet_id);
-	ret = nfq_get_payload(nfa, &buffer);
-
-    PEP_DEBUG("payload_len = %d", ret);
     proxy = alloc_proxy();
     if (!proxy) {
         pep_warning("Failed to allocate new pep_proxy instance! [%s:%d]",
@@ -523,41 +516,45 @@ static int nfqueue_get_syn(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
         goto err;
     }
 
-    /* Setup source and destination endpoints */
-	ip4 = (struct ipv4_packet *)buffer;
-    proxy->src.addr = ntohl(ip4->iph.saddr);
-    proxy->src.port = ntohs(ip4->tcph.source);
-    proxy->dst.addr = ntohl(ip4->iph.daddr);
-    proxy->dst.port = ntohs(ip4->tcph.dest);
-    proxy->syn_time = time(NULL);
+    /* Socket is bound to original destination */
+    if(getsockname(sockfd, (struct sockaddr *) &orig_dst, &addrlen) < 0){
+        pep_warning("Failed to get original dest from socket! [%s:%d]",
+                    strerror(errno), errno);
+        ret = -1;
+        goto err;
+    }
 
-	/* Check for duplicate syn, and drop it.
+    /* Setup source and destination endpoints */
+    proxy->src.addr = ntohl(cliaddr.sin_addr.s_addr);
+    proxy->src.port = ntohs(cliaddr.sin_port);
+    proxy->dst.addr = ntohl(orig_dst.sin_addr.s_addr);
+    proxy->dst.port = ntohs(orig_dst.sin_port);
+    proxy->syn_time = time(NULL);
+    syntab_format_key(proxy, &key);
+
+    /* Check for duplicate syn, and drop it.
      * This happens when RTT is too long and we
      * still didn't establish the connection.
      */
     SYNTAB_LOCK_WRITE();
-    dup = syntab_find(proxy->src.addr, proxy->src.port);
+    dup = syntab_find(&key);
     if (dup != NULL) {
         PEP_DEBUG_DP(dup, "Duplicate SYN. Dropping...");
         SYNTAB_UNLOCK_WRITE();
-        nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
-
         goto err;
-	}
+    }
 
-	/* add to the table... */
+    /* add to the table... */
     proxy->status = PST_PENDING;
     ret = syntab_add(proxy);
     SYNTAB_UNLOCK_WRITE();
     if (ret < 0) {
         pep_warning("Failed to insert pep_proxy into a hash table!");
-        nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
         goto err;
     }
 
     added = 1;
     PEP_DEBUG_DP(proxy, "Registered new SYN");
-	ret = nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
     if (ret < 0) {
         pep_warning("nfq_set_verdict to NF_ACCEPT failed! [%s:%d]",
                     strerror(errno), errno);
@@ -568,9 +565,7 @@ static int nfqueue_get_syn(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
 
 err:
     if (added) {
-        SYNTAB_LOCK_WRITE();
         syntab_delete(proxy);
-        SYNTAB_UNLOCK_WRITE();
     }
     if (proxy != NULL) {
         unpin_proxy(proxy);
@@ -579,68 +574,18 @@ err:
     return ret;
 }
 
-static void *queuer_loop(void __attribute__((unused)) *unused)
-{
-	struct nfq_handle *h;
-	struct nfq_q_handle *qh;
-	struct nfnl_handle *nh;
-
-	int fd, i, ret;
-	char buf[QUEUER_BUF_SIZE];
-    ssize_t rc;
-
-    PEP_DEBUG("Opening NFQ library handle");
-    h = nfq_open();
-    if (!h) {
-        pep_error("Failed to open NFQ handler!");
-    }
-
-    PEP_DEBUG("unbinding existing nf_queue handler "
-              "for AF_INET (if any)");
-    nfq_unbind_pf(h, AF_INET);
-
-    PEP_DEBUG("binding nfnetlink_queue as "
-              "nf_queue handler for AF_INET");
-    ret = nfq_bind_pf(h, AF_INET);
-    if (ret < 0) {
-        pep_error("Failed to bind NFQ handler! [RET = %d]", ret);
-    }
-
-    PEP_DEBUG("binding this socket to queue '%d'", queuenum);
-    qh = nfq_create_queue(h, queuenum, &nfqueue_get_syn, NULL);
-    if (!qh) {
-        pep_error("Failed to create nfnetlink queue!");
-    }
-
-    PEP_DEBUG("setting copy_packet mode");
-    ret = nfq_set_mode(qh, NFQNL_COPY_PACKET, 0xffff);
-    if (ret < 0) {
-        pep_error("Failed to setup NFQ packet_copy mode! [RET = %d]", ret);
-    }
-
-    nh = nfq_nfnlh(h);
-    fd = nfnl_fd(nh);
-
-    while ((rc = recv(fd, buf, QUEUER_BUF_SIZE, 0)) >= 0) {
-        PEP_DEBUG("received packet [sz = %d]", rc);
-        nfq_handle_packet(h, buf, rc);
-    }
-
-    PEP_DEBUG("Exiting [rc=%d]", rc);
-    nfq_close(h);
-    pthread_exit(NULL);
-}
 
 void *listener_loop(void UNUSED(*unused))
 {
-    int                 listenfd, optval, ret, connfd, out_fd, c_addr;
-	struct sockaddr_in  cliaddr, servaddr,
+    int                 listenfd, optval, ret, connfd, out_fd;
+    struct sockaddr_in  cliaddr, servaddr,
                         r_servaddr, proxy_servaddr;
     socklen_t           len;
     struct pep_proxy   *proxy;
     struct hostent     *host;
-    char                ipbuf[17];
+    char                ipbuf[17], ipbuf1[17];
     unsigned short      r_port, c_port;
+    struct syntab_key   key;
 
     listenfd = socket(AF_INET, SOCK_STREAM, 0);
     if (listenfd < 0) {
@@ -659,6 +604,23 @@ void *listener_loop(void UNUSED(*unused))
                      &optval, sizeof(optval));
     if (ret < 0) {
         pep_error("Failed to set SOL_REUSEADDR option! [RET = %d]", ret);
+    }
+ 
+    /* Set socket transparent (able to bind to external address) */
+    ret = setsockopt(listenfd, SOL_IP, IP_TRANSPARENT,
+                     &optval, sizeof(optval));
+    if (ret < 0) {
+        pep_error("Failed to set IP_TRANSPARENT option! [RET = %d]", ret);
+    }
+
+    /* Set TCP_FASTOPEN socket option */
+    if (fastopen) {
+      optval = 5;
+      ret = setsockopt(listenfd, SOL_TCP, TCP_FASTOPEN,
+                       &optval, sizeof(optval));
+      if (ret < 0) {
+          pep_error("Failed to set TCP_FASTOPEN option! [RET = %d]", ret);
+      }
     }
 
     ret = bind(listenfd, (struct sockaddr *)&servaddr, sizeof(servaddr));
@@ -690,13 +652,27 @@ void *listener_loop(void UNUSED(*unused))
          * Try to find incomming connection in our SYN table
          * It must be already there waiting for activation.
          */
-        c_addr = ntohl(cliaddr.sin_addr.s_addr);
-        c_port = ntohs(cliaddr.sin_port);
-        toip(ipbuf, c_addr);
-        PEP_DEBUG("New incomming connection: %s:%d", ipbuf, c_port);
+        key.addr = ntohl(cliaddr.sin_addr.s_addr);
+        key.port = ntohs(cliaddr.sin_port);
+        toip(ipbuf, key.addr);
+        PEP_DEBUG("New incomming connection: %s:%d", ipbuf, key.port);
 
         SYNTAB_LOCK_READ();
-        proxy = syntab_find(c_addr, c_port);
+        proxy = syntab_find(&key);
+
+        /*
+         * If the proxy is not in the table, add the entry.
+         */
+        if (!proxy) {
+            SYNTAB_UNLOCK_READ();
+            save_proxy_from_socket(connfd, cliaddr);
+            SYNTAB_LOCK_READ();
+            proxy = syntab_find(&key);
+        }
+
+        /*
+         * If still can't find key in the table, there is an error.
+         */
         if (!proxy) {
             pep_warning("Can not find the connection in SYN table. "
                         "Terminating!");
@@ -741,10 +717,24 @@ void *listener_loop(void UNUSED(*unused))
         out_fd = ret;
         fcntl(out_fd, F_SETFL, O_NONBLOCK);
 
+        /*
+         * Set outbound endpoint to transparent mode
+         * (bind to external address)
+         */
+        ret = setsockopt(out_fd, SOL_IP, IP_TRANSPARENT,
+                         &optval, sizeof(optval));
+        if (ret < 0) {
+            pep_error("Failed to set IP_TRANSPARENT option! [RET = %d]", ret);
+        }
+
+        toip(ipbuf, proxy->src.addr);
+        toip(ipbuf1, proxy->dst.addr);
         memset(&proxy_servaddr, 0, sizeof(proxy_servaddr));
         proxy_servaddr.sin_family = AF_INET;
-        proxy_servaddr.sin_addr.s_addr = inet_addr(pepsal_ip_addr);
-        proxy_servaddr.sin_port = htons(0);
+        proxy_servaddr.sin_addr.s_addr = inet_addr(ipbuf);
+        proxy_servaddr.sin_port = htons(proxy->src.port);
+        PEP_DEBUG("# Binding socket [%s:%d] --> [%s:%d]",
+                  ipbuf, proxy->src.port, ipbuf1, proxy->dst.port); 
 
         ret = bind(out_fd, (struct sockaddr *)&proxy_servaddr,
                    sizeof(proxy_servaddr));
@@ -754,8 +744,14 @@ void *listener_loop(void UNUSED(*unused))
             goto close_connection;
         }
 
-        ret = connect(out_fd, (struct sockaddr *)&r_servaddr,
-                      sizeof(struct sockaddr));
+        if (fastopen) {
+          ret = sendto(out_fd, PEPBUF_WPOS(&proxy->src.buf), 0, MSG_FASTOPEN,
+                       (struct sockaddr *)&r_servaddr, sizeof(r_servaddr));
+        }
+        else {
+          ret = connect(out_fd, (struct sockaddr *)&r_servaddr,
+                        sizeof(r_servaddr));
+        }
         if ((ret < 0) && !nonblocking_err_p(errno)) {
             pep_warning("Failed to connect! [%s:%d]", strerror(errno), errno);
             goto close_connection;
@@ -884,7 +880,7 @@ static void *poller_loop(void  __attribute__((unused)) *unused)
         if (!num_clients) {
             sigprocmask(SIG_UNBLOCK, &sigset, NULL);
             sigwaitinfo(&sigset, NULL);
-		continue;
+        continue;
         }
 
         sigprocmask(SIG_UNBLOCK, &sigset, NULL);
@@ -892,7 +888,7 @@ static void *poller_loop(void  __attribute__((unused)) *unused)
         if (pollret < 0) {
             if (errno == EINTR) {
                 /* It seems that new client just appered. Renew descriptors. */
-		continue;
+        continue;
             }
 
             pep_error("poll() error!");
@@ -1079,12 +1075,6 @@ static void *timer_sch_loop(void __attribute__((unused)) *unused)
 static void init_pep_threads(void)
 {
     int ret;
-    PEP_DEBUG("Creating queuer thread");
-    ret = pthread_create(&queuer, NULL, queuer_loop, NULL);
-    if (ret) {
-        pep_error("Failed to create the queuer thread! [RET = %d]", ret);
-    }
-
     PEP_DEBUG("Creating listener thread");
     ret = pthread_create(&listener, NULL, listener_loop, NULL);
     if (ret) {
@@ -1143,7 +1133,7 @@ int main(int argc, char *argv[])
             {"daemon", 1, 0, 'd'},
             {"verbose", 1, 0, 'v'},
             {"help", 0, 0, 'h'},
-            {"queue", 1, 0, 'q'},
+            {"fastopen", 0, 0, 'f'},
             {"port", 1, 0, 'p'},
             {"version", 0, 0, 'V'},
             {"address", 1, 0, 'a'},
@@ -1154,7 +1144,7 @@ int main(int argc, char *argv[])
             {0, 0, 0, 0}
         };
 
-        c = getopt_long(argc, argv, "dvVhq:p:a:l:g:t:c:",
+        c = getopt_long(argc, argv, "dvVhfp:a:l:g:t:c:",
                         long_options, &option_index);
         if (c == -1)
             break;
@@ -1169,8 +1159,8 @@ int main(int argc, char *argv[])
             case 'h':
                 usage(argv[0]); //implies exit
                 break;
-            case 'q':
-                queuenum = atoi(optarg);
+            case 'f':
+                fastopen = 1;
                 break;
             case 'p':
                 portnum = atoi(optarg);
@@ -1200,6 +1190,7 @@ int main(int argc, char *argv[])
                 exit(0);
         }
     }
+    openlog(PROGRAM_NAME, LOG_PID, LOG_DAEMON);
 
     if (background) {
         PEP_DEBUG("Daemonizing...");
@@ -1238,10 +1229,10 @@ int main(int argc, char *argv[])
     create_threads_pool(PEPPOOL_THREADS);
 
     PEP_DEBUG("Pepsal started...");
-    pthread_join(queuer, &valptr);
     pthread_join(listener, &valptr);
     pthread_join(poller, &valptr);
     pthread_join(timer_sch, &valptr);
-    printf("exiting...\n");
+    PEP_DEBUG("exiting...\n");
+    closelog();
     return 0;
 }
