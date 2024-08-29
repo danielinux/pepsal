@@ -3,6 +3,17 @@ PEPsal: A TCP Performance Enhancing Proxy for satellite links
 http://www.sourceforge.net/projects/pepsal
 -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 
+Update 2024/08/29
+-=-=-=-=-=-=-=-=-
+After many years of inactivity, this repository is now marked as archived.
+A more recent branch is currently actively developed and maintained by the
+French national space agency (CNES), in compliance with the original license
+and goals for the project.
+
+Please refer to their publicly available repository here: https://github.com/CNES/pepsal/
+
+-=-=-=-=-=-=-=-=-
+
 PEPsal is a multi layer proxy. At the network level, it uses netfilter to intercept those 
 connections that would involve a satellite links and "steals" the TCP SYN packet in 
 the three-way handshake phase of a TCP connection, then pretends to be the other side of that 
